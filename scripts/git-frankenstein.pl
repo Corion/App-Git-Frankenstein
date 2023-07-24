@@ -11,11 +11,16 @@ use Getopt::Long;
 
 GetOptions(
     's|source-repository=s' => \my $source_repository,
+    's|source-directory=s' => \my $source_directory,
     't|target-repository=s' => \my $target_repository,
     'v|verbose'             => \my $verbose,
     'p=i'                   => \my $path_segments,
 );
-$path_segments //= 2;
+
+# This is very local to my setup
+$source_directory //= 'template';
+$path_segments    //= 2;
+$source_repository //= '/home/corion/Projekte/Dist-Template/';
 
 $target_repository //= '.';
 
@@ -27,6 +32,11 @@ my ($action, @refspec) = @ARGV;
 if( $action eq 'list' ) {
     # ... nothing to do here
     die "Can't list _and_ apply patches"
+        if @refspec;
+
+} elsif( $action eq 'auto' ) {
+    # ... nothing to do here
+    die "Can't combine 'auto' with patches"
         if @refspec;
 
 } elsif( $action ne 'apply' ) {
@@ -50,7 +60,9 @@ sub run(@command) {
     return trimmed(@stdout);
 }
 
-sub run_pipe($stdin, @command) {
+sub run_pipe($options, @command) {
+    my $stdin = delete $options->{ stdin };
+    my $silent = delete $options->{ silent };
     if( $verbose ) {
         say "| @command";
     }
@@ -58,7 +70,7 @@ sub run_pipe($stdin, @command) {
         return_if_system_error => 1,
         binmode_stdout => ':utf8',
     }) == -1 and warn "Command [@command] failed: $! / $?";
-    if( @stderr ) {
+    if( !$silent and @stderr ) {
         warn "$_" for @stderr;
     }
     return trimmed(@stdout);
@@ -68,8 +80,8 @@ sub git(@command) {
     return run(git => @command)
 }
 
-sub git_pipe($stdin, @command) {
-    return run_pipe($stdin, git => @command)
+sub git_pipe($options, @command) {
+    return run_pipe($options, git => @command)
 }
 
 sub changed_files_by_commit( $this_commit ) {
@@ -104,11 +116,11 @@ sub commit_message( $repo, $commit ) {
 }
 
 sub patch_applies( $repo, $diff ) {
-    my @msg = git_pipe( $diff => '-C', $repo, 'apply' => '--check', '-p', $path_segments, '-' );
+    my @msg = git_pipe( { stdin => $diff, silent => 1 } => '-C', $repo, 'apply' => '--check', '-p', $path_segments, '-' );
 
-    if( $? ) {
-        say $_ for @msg
-    }
+    #if( $? ) {
+    #    say $_ for @msg
+    #}
 
     pop @msg while (@msg and $msg[-1] eq '');
     return @msg
@@ -117,7 +129,7 @@ sub patch_applies( $repo, $diff ) {
 # patch_applied = apply_patch --reverse
 
 sub apply_patch( $repo, $diff ) {
-    my @msg = git_pipe( $diff => '-C', $repo, 'am' => '-p', $path_segments, '-' );
+    my @msg = git_pipe( { stdin => $diff } => '-C', $repo, 'am' => '-p', $path_segments, '-' );
 
     if( $? ) {
         say $_ for @msg
@@ -134,15 +146,53 @@ sub get_patch( $repo, $commit ) {
     return @msg
 }
 
-for my $ref (@refspec) {
+sub list_patches( $repo ) {
+    my @msg = git( '-C', $repo, 'log', '--pretty=%H', $source_directory );
+    pop @msg while (@msg and $msg[-1] eq '');
+    return reverse @msg
+}
+
+sub process_ref( $ref, %options ) {
     my $p   = join "\n", get_patch($source_repository, $ref);
-    my $msg = join "\n", commit_message( $source_repository, $ref );
+    my ($headline, @msg) = commit_message( $source_repository, $ref );
     if( patch_applies( $target_repository, $p ) == 0 and ! $?) {
-        say $msg;
-        apply_patch( $target_repository, $p );
+        say "$ref $headline";
+        if( $options{ apply }) {
+            apply_patch( $target_repository, $p );
+        }
     } else {
-        say "SKIP: $msg";
+        if( $options{ apply } and not $options{ silent_fail }) {
+            say "SKIP: $ref $headline";
+        }
     }
+}
+
+sub cmd_apply(@refspec) {
+    for my $ref (@refspec) {
+        process_ref( $ref, apply => 1 );
+    }
+}
+
+sub cmd_list() {
+    my @patches = list_patches($source_repository);
+    for my $ref (@patches) {
+        process_ref( $ref, apply => 0 );
+    }
+}
+
+sub cmd_apply_auto() {
+    my @patches = list_patches($source_repository);
+    for my $ref (@patches) {
+        process_ref( $ref, apply => 1, silent_fail => 1 );
+    }
+}
+
+if( $action eq 'apply' ) {
+    cmd_apply( @refspec );
+} elsif( $action eq 'list' ) {
+    cmd_list();
+} elsif( $action eq 'auto' ) {
+    cmd_apply_auto();
 }
 
 __DATA__
